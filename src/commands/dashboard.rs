@@ -46,6 +46,8 @@ pub struct Dashboard {
     config_editor_input: String,
     config_agent_input: String,
     config_selected_field: ConfigField, // Which field is currently selected
+    delete_confirm_mode: bool,
+    delete_confirm_worktree: Option<String>, // Store worktree name for confirmation
 }
 
 struct WorktreeDisplay {
@@ -83,6 +85,8 @@ impl Dashboard {
             config_editor_input: String::new(),
             config_agent_input: String::new(),
             config_selected_field: ConfigField::Editor,
+            delete_confirm_mode: false,
+            delete_confirm_worktree: None,
         };
 
         dashboard.refresh_worktrees();
@@ -348,6 +352,54 @@ impl Dashboard {
             return Ok(InputResult::Continue);
         }
 
+        // Handle delete confirmation mode input
+        if self.delete_confirm_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    // Cancel delete confirmation
+                    self.delete_confirm_mode = false;
+                    self.delete_confirm_worktree = None;
+                    self.status_message = Some("❌ Delete cancelled".to_string());
+                    self.status_message_timer = 3;
+                }
+                KeyCode::Enter => {
+                    // Confirm delete and proceed with deletion
+                    if let Some(worktree_name) = &self.delete_confirm_worktree.clone() {
+                        // Find the worktree by name
+                        if let Some(worktree) =
+                            self.worktrees.iter().find(|w| w.name == *worktree_name)
+                        {
+                            let worktree_data = WorktreeDisplay {
+                                name: worktree.name.clone(),
+                                repo: worktree.repo.clone(),
+                                key: worktree.key.clone(),
+                                has_session: worktree.has_session,
+                                claude_status: worktree.claude_status.clone(),
+                            };
+
+                            match self.quick_delete_worktree(&worktree_data) {
+                                Ok(_) => {
+                                    self.status_message =
+                                        Some(format!("✅ Deleted worktree: {}", worktree_name));
+                                    self.status_message_timer = 5;
+                                    self.refresh()?;
+                                }
+                                Err(e) => {
+                                    self.status_message =
+                                        Some(format!("❌ Failed to delete: {}", e));
+                                    self.status_message_timer = 5;
+                                }
+                            }
+                        }
+                    }
+                    self.delete_confirm_mode = false;
+                    self.delete_confirm_worktree = None;
+                }
+                _ => {}
+            }
+            return Ok(InputResult::Continue);
+        }
+
         // Handle config mode input
         if self.config_mode {
             match key.code {
@@ -525,7 +577,7 @@ impl Dashboard {
                     self.create_repo = self.worktrees.first().map(|w| w.repo.clone());
                 }
             }
-            KeyCode::Char('d' | 'D') => {
+            KeyCode::Char('d') => {
                 // Get the actual worktree index from the mapping
                 if let Some(Some(worktree_idx)) = self.list_index_map.get(self.selected)
                     && let Some(worktree) = self.worktrees.get(*worktree_idx)
@@ -535,6 +587,15 @@ impl Dashboard {
                         self.tmux.kill_session(&worktree.name)?;
                     }
                     self.refresh()?;
+                }
+            }
+            KeyCode::Char('D') => {
+                // Show confirmation dialog for delete
+                if let Some(Some(worktree_idx)) = self.list_index_map.get(self.selected)
+                    && let Some(worktree) = self.worktrees.get(*worktree_idx)
+                {
+                    self.delete_confirm_mode = true;
+                    self.delete_confirm_worktree = Some(worktree.name.clone());
                 }
             }
             KeyCode::Char('r' | 'R') => {
@@ -582,6 +643,95 @@ impl Dashboard {
 
         // Attach to the session
         self.tmux.attach_session(project)?;
+
+        Ok(())
+    }
+
+    fn quick_delete_worktree(&mut self, worktree: &WorktreeDisplay) -> Result<()> {
+        // Get worktree info from state
+        let worktree_info = self
+            .state
+            .worktrees
+            .get(&worktree.key)
+            .context("Worktree info not found")?;
+
+        // Check if worktree directory exists
+        if !worktree_info.path.exists() {
+            // Just remove from state if directory doesn't exist
+            self.state.worktrees.remove(&worktree.key);
+            self.state.save()?;
+            return Ok(());
+        }
+
+        // Kill tmux session if exists
+        if worktree.has_session {
+            let _ = self.tmux.kill_session(&worktree.name);
+        }
+
+        // Get main repo path
+        let main_repo_path = worktree_info
+            .path
+            .parent()
+            .map(|parent| parent.join(&worktree_info.repo_name))
+            .context("Failed to get main repo path")?;
+
+        // Check if main repo exists
+        if !main_repo_path.exists() {
+            anyhow::bail!("Main repository not found at {}", main_repo_path.display());
+        }
+
+        // Perform basic checks - if worktree has issues, defer to full delete command
+        let current_dir = std::env::current_dir()?;
+        let check_result = std::env::set_current_dir(&worktree_info.path).map(|_| {
+            let has_changes = !crate::git::is_working_tree_clean().unwrap_or(false);
+            let has_unpushed = crate::git::has_unpushed_commits();
+            (has_changes, has_unpushed)
+        });
+
+        // If we can't check or there are issues, require full delete process
+        match check_result {
+            Ok((true, _)) | Ok((_, true)) => {
+                anyhow::bail!(
+                    "Worktree has pending changes. Use 'xlaude delete' command for full deletion process."
+                );
+            }
+            Err(_) => {
+                anyhow::bail!(
+                    "Cannot check worktree status. Use 'xlaude delete' command for safe deletion."
+                );
+            }
+            Ok((false, false)) => {
+                // Safe to proceed with quick delete
+            }
+        }
+
+        // Change to main repo directory for deletion
+        std::env::set_current_dir(&main_repo_path)
+            .context("Failed to change to main repository")?;
+
+        // Remove worktree
+        crate::git::execute_git(&["worktree", "remove", worktree_info.path.to_str().unwrap()])
+            .or_else(|_| {
+                // Try force removal if normal removal fails
+                crate::git::execute_git(&[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    worktree_info.path.to_str().unwrap(),
+                ])
+            })
+            .context("Failed to remove worktree")?;
+
+        // Try to delete branch (safe delete first, then force if needed)
+        let _ = crate::git::execute_git(&["branch", "-d", &worktree_info.branch])
+            .or_else(|_| crate::git::execute_git(&["branch", "-D", &worktree_info.branch]));
+
+        // Update state
+        self.state.worktrees.remove(&worktree.key);
+        self.state.save()?;
+
+        // Restore original directory
+        std::env::set_current_dir(current_dir).ok();
 
         Ok(())
     }
@@ -649,6 +799,8 @@ impl Dashboard {
                 Span::raw(" New  "),
                 Span::styled("d", Style::default().fg(Color::Yellow)),
                 Span::raw(" Stop  "),
+                Span::styled("D", Style::default().fg(Color::Yellow)),
+                Span::raw(" Delete  "),
                 Span::styled("c", Style::default().fg(Color::Yellow)),
                 Span::raw(" Config  "),
                 Span::styled("r", Style::default().fg(Color::Yellow)),
@@ -670,6 +822,8 @@ impl Dashboard {
                 Span::raw(" New  "),
                 Span::styled("d", Style::default().fg(Color::Yellow)),
                 Span::raw(" Stop  "),
+                Span::styled("D", Style::default().fg(Color::Yellow)),
+                Span::raw(" Delete  "),
                 Span::styled("c", Style::default().fg(Color::Yellow)),
                 Span::raw(" Config  "),
                 Span::styled("r", Style::default().fg(Color::Yellow)),
@@ -691,6 +845,11 @@ impl Dashboard {
         // Render config dialog if in config mode
         if self.config_mode {
             self.render_config_dialog(f);
+        }
+
+        // Render delete confirmation dialog if in delete confirm mode
+        if self.delete_confirm_mode {
+            self.render_delete_confirm_dialog(f);
         }
     }
 
@@ -896,6 +1055,11 @@ impl Dashboard {
             ]),
             Line::from(vec![
                 Span::raw("  "),
+                Span::styled("D", Style::default().fg(Color::Yellow)),
+                Span::raw("      Quick delete worktree (with confirmation)"),
+            ]),
+            Line::from(vec![
+                Span::raw("  "),
                 Span::styled("r", Style::default().fg(Color::Yellow)),
                 Span::raw("      Refresh list"),
             ]),
@@ -1078,6 +1242,47 @@ impl Dashboard {
                     .borders(Borders::ALL)
                     .title(" Configuration ")
                     .border_style(Style::default().fg(Color::Blue)),
+            )
+            .alignment(Alignment::Center);
+
+        f.render_widget(dialog, area);
+    }
+
+    fn render_delete_confirm_dialog(&self, f: &mut Frame) {
+        // Calculate dialog area (centered, 50% width, 30% height)
+        let area = centered_rect(50, 30, f.area());
+
+        // Clear the dialog area
+        let clear = ratatui::widgets::Clear;
+        f.render_widget(clear, area);
+
+        // Get the worktree name for confirmation
+        let worktree_name = self.delete_confirm_worktree.as_deref().unwrap_or("Unknown");
+
+        // Create the dialog content
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("Delete worktree '{}'", worktree_name),
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+            )),
+            Line::from(""),
+            Line::from("This will permanently delete the worktree and branch."),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Enter", Style::default().fg(Color::Green)),
+                Span::raw(" to confirm  "),
+                Span::styled("Esc", Style::default().fg(Color::Red)),
+                Span::raw(" to cancel"),
+            ]),
+        ];
+
+        let dialog = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Confirm Delete ")
+                    .border_style(Style::default().fg(Color::Red)),
             )
             .alignment(Alignment::Center);
 
